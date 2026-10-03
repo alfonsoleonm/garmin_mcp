@@ -657,7 +657,19 @@ def main():
         )
 
     # Run the MCP server
-    app.run(transport=transport)
+    secret = os.getenv("MCP_PATH_SECRET", "").strip()
+    if transport == "streamable-http" and secret:
+        from garmin_mcp.http_auth import run_with_path_secret
+
+        run_with_path_secret(fastmcp, secret, http_host, http_port)
+    else:
+        if transport != "stdio" and http_host not in ("127.0.0.1", "localhost", "::1"):
+            print(
+                "Refusing to serve HTTP on a non-loopback address without MCP_PATH_SECRET.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        app.run(transport=transport)
 
 
 if __name__ == "__main__":
