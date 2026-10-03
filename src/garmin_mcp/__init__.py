@@ -31,6 +31,7 @@ from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
 from garmin_mcp import calendar_events
+from garmin_mcp import dashboard
 
 
 def is_interactive_terminal() -> bool:
@@ -588,6 +589,7 @@ def main():
     # Configure all modules with the Garmin client
     activity_management.configure(garmin_client)
     health_wellness.configure(garmin_client)
+    dashboard.configure(garmin_client)
     user_profile.configure(garmin_client)
     devices.configure(garmin_client)
     gear_management.configure(garmin_client)
@@ -650,6 +652,8 @@ def main():
         @fastmcp.custom_route("/healthz", methods=["GET"])
         async def healthz(_request: "Request") -> "PlainTextResponse":
             return PlainTextResponse("ok")
+
+        dashboard.register_route(fastmcp)
 
         print(
             f"Serving MCP over {transport} on {http_host}:{http_port}",

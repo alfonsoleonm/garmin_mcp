@@ -14,6 +14,14 @@ class PathSecretMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # /api/* carries its own Bearer auth; bypass the path secret so
+        # the inner app can handle it.  This cannot reach /mcp because the
+        # inner app has no /api/mcp route — FastMCP registers /mcp only
+        # after the secret is stripped.
+        if scope["path"].startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+
         parts = scope["path"].split("/", 2)  # ['', secret, rest]
         candidate = parts[1].encode() if len(parts) > 1 else b""
         if not hmac.compare_digest(candidate, self.secret):

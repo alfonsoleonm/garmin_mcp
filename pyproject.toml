@@ -16,6 +16,7 @@ dependencies = [
     # MCPServer). Cap until the server is ported to the new API.
     "mcp>=1.28.1,<2",
     "fitparse>=1.2.0",
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
