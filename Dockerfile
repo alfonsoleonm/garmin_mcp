@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Install uv for faster dependency management
 # https://github.com/astral-sh/uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN pip install --no-cache-dir uv
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
