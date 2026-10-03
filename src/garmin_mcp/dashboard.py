@@ -2,9 +2,10 @@
 import asyncio
 import datetime
 import hmac
+import math
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from starlette.requests import Request
@@ -165,61 +166,105 @@ async def _fetch_stats(
     return bb, rhr
 
 
-async def _fetch_training_readiness(date_str: str) -> Optional[Dict[str, Any]]:
-    raw = await _run_blocking(_garmin_client.get_training_readiness, date_str)
-    if not raw:
-        return None
-    items = raw if isinstance(raw, list) else [raw]
-    if not items:
-        return None
-    latest = items[-1] if isinstance(items[-1], dict) else {}
-    result = {
-        k: v
-        for k, v in {
-            "score": latest.get("score"),
-            "level": latest.get("level"),
-            "feedback": latest.get("feedbackShort"),
-            "sleep_score": latest.get("sleepScore"),
-            "hrv_weekly_avg": latest.get("hrvWeeklyAverage"),
-            "acute_load": latest.get("acuteLoad"),
-        }.items()
-        if v is not None
-    }
-    return result or None
+async def _fetch_activities(date_str: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch activities for 7 days ending on date_str, grouped by date.
 
+    Uses connectapi directly to avoid the library's auto-pagination loop,
+    which can cause "result too large" errors on accounts with large histories.
+    """
+    end = datetime.date.fromisoformat(date_str)
+    start_str = (end - datetime.timedelta(days=6)).isoformat()
 
-async def _fetch_training_load(date_str: str) -> Optional[Dict[str, Any]]:
-    raw = await _run_blocking(_garmin_client.get_training_status, date_str)
-    if not raw or not isinstance(raw, dict):
-        return None
-    recent = raw.get("mostRecentTrainingStatus") or {}
-    latest_data = (
-        recent.get("latestTrainingStatusData") or {}
-        if isinstance(recent, dict)
-        else {}
+    raw = await _run_blocking(
+        lambda: _garmin_client.connectapi(
+            _garmin_client.garmin_connect_activities,
+            params={"startDate": start_str, "endDate": date_str, "start": "0", "limit": "100"},
+        )
     )
-    device_data: Dict[str, Any] = {}
-    if isinstance(latest_data, dict):
-        for data in latest_data.values():
-            if isinstance(data, dict) and data:
-                device_data = data
-                break
-    acwr = device_data.get("acuteTrainingLoadDTO") or {}
-    if not isinstance(acwr, dict):
-        acwr = {}
-    result = {
-        k: v
-        for k, v in {
-            "training_status": device_data.get("trainingStatus"),
-            "feedback": device_data.get("trainingStatusFeedbackPhrase"),
-            "acute_load": acwr.get("dailyTrainingLoadAcute"),
-            "chronic_load": acwr.get("dailyTrainingLoadChronic"),
-            "load_ratio": acwr.get("dailyAcuteChronicWorkloadRatio"),
-            "acwr_status": acwr.get("acwrStatus"),
-        }.items()
-        if v is not None
+
+    # Pre-fill all 7 days so missing days appear as empty lists.
+    result: Dict[str, List[Dict[str, Any]]] = {
+        (end - datetime.timedelta(days=i)).isoformat(): [] for i in range(7)
     }
-    return result or None
+
+    for a in raw or []:
+        start_time = a.get("startTimeLocal", "")
+        day = start_time[:10] if start_time else None
+        if not day or day not in result:
+            continue
+        entry: Dict[str, Any] = {}
+        duration = a.get("duration")
+        if duration is not None:
+            entry["duration_s"] = round(duration)
+        avg_hr = a.get("averageHR")
+        if avg_hr is not None:
+            entry["average_hr"] = avg_hr
+        max_hr = a.get("maxHR")
+        if max_hr is not None:
+            entry["max_hr"] = max_hr
+        calories = a.get("calories")
+        if calories is not None:
+            entry["calories"] = round(calories)
+        act_type = (a.get("activityType") or {}).get("typeKey")
+        if act_type:
+            entry["type"] = act_type
+        aerobic_te = a.get("aerobicTrainingEffect")
+        if aerobic_te is not None:
+            entry["aerobic_te"] = aerobic_te
+        anaerobic_te = a.get("anaerobicTrainingEffect")
+        if anaerobic_te is not None:
+            entry["anaerobic_te"] = anaerobic_te
+        result[day].append(entry)
+
+    return result
+
+
+def _athlete_max_hr() -> int:
+    """Return athlete max HR from DASHBOARD_MAX_HR env var (default 190, range 120–230).
+
+    Falls back to 190 when the var is absent, non-integer, or out of range.
+    """
+    raw = os.environ.get("DASHBOARD_MAX_HR", "")
+    if raw:
+        try:
+            val = int(raw)
+            if 120 <= val <= 230:
+                return val
+        except ValueError:
+            pass
+    return 190
+
+
+def _compute_strain_7d(
+    activities_by_day: Dict[str, List[Dict[str, Any]]],
+    resting_hr_bpm: Optional[int],
+) -> Dict[str, Optional[float]]:
+    # TRIMP (Training Impulse) per Banister (1991).
+    # For each activity: trimp = duration_min × ratio × exp(1.92 × ratio)
+    # where ratio = (avg_hr − resting_hr) / (HRMAX − resting_hr), clamped to [0, 1].
+    # HRMAX is the athlete's max HR from DASHBOARD_MAX_HR env var (default 190).
+    # Day total = Σ per-activity TRIMPs, rounded to 1 decimal.
+    # Activities missing duration_s or average_hr are skipped.
+    rhr = resting_hr_bpm if resting_hr_bpm and resting_hr_bpm > 0 else 60
+    hrmax = _athlete_max_hr()
+    if hrmax <= rhr:
+        return {day: 0.0 for day in activities_by_day}
+    result: Dict[str, Optional[float]] = {}
+    for day, acts in activities_by_day.items():
+        if not acts:
+            result[day] = None
+            continue
+        total = 0.0
+        for a in acts:
+            duration_s = a.get("duration_s")
+            avg_hr = a.get("average_hr")
+            if duration_s is None or avg_hr is None:
+                continue
+            ratio = (avg_hr - rhr) / (hrmax - rhr)
+            ratio = max(0.0, min(1.0, ratio))
+            total += (duration_s / 60.0) * ratio * math.exp(1.92 * ratio)
+        result[day] = round(total, 1) if total > 0 else None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +341,20 @@ async def _dashboard_handler(request: Request) -> Response:
         _safe("sleep", _fetch_sleep(date_str)),
         _safe("hrv", _fetch_hrv(date_str)),
         _do_stats(),
-        _safe("training_readiness", _fetch_training_readiness(date_str)),
-        _safe("training_load", _fetch_training_load(date_str)),
+        _safe("activities", _fetch_activities(date_str)),
     )
+
+    # strain_7d is pure computation from activities + resting_hr — no IO.
+    if sections.get("activities") is not None:
+        try:
+            rhr_section = sections.get("resting_hr")
+            rhr_bpm = rhr_section.get("bpm") if isinstance(rhr_section, dict) else None
+            sections["strain_7d"] = _compute_strain_7d(sections["activities"], rhr_bpm)
+        except Exception as exc:
+            sections["strain_7d"] = None
+            errors["strain_7d"] = type(exc).__name__
+    else:
+        sections["strain_7d"] = None
 
     payload: Dict[str, Any] = {"date": date_str, **sections}
     if errors:

@@ -80,32 +80,7 @@ def client():
         "restingHeartRate": 52,
         "lastSevenDaysAvgRestingHeartRate": 53,
     }
-    mock.get_training_readiness.return_value = [
-        {
-            "score": 68,
-            "level": "MODERATE",
-            "feedbackShort": "TRAINING_READINESS_MODERATE",
-            "sleepScore": 75,
-            "hrvWeeklyAverage": 52,
-            "acuteLoad": 245,
-        }
-    ]
-    mock.get_training_status.return_value = {
-        "mostRecentTrainingStatus": {
-            "latestTrainingStatusData": {
-                "device-1": {
-                    "trainingStatus": "PRODUCTIVE",
-                    "trainingStatusFeedbackPhrase": "TRAINING_STATUS_PRODUCTIVE",
-                    "acuteTrainingLoadDTO": {
-                        "dailyTrainingLoadAcute": 245.3,
-                        "dailyTrainingLoadChronic": 210.5,
-                        "dailyAcuteChronicWorkloadRatio": 1.17,
-                        "acwrStatus": "OPTIMAL",
-                    },
-                }
-            }
-        }
-    }
+    mock.connectapi.return_value = []  # default: no activities
     dash.configure(mock)
     return mock
 
@@ -168,8 +143,8 @@ class TestSuccess:
         assert "hrv" in body
         assert "body_battery" in body
         assert "resting_hr" in body
-        assert "training_readiness" in body
-        assert "training_load" in body
+        assert "activities" in body
+        assert "strain_7d" in body
         assert "errors" not in body
 
     async def test_hrv_fields_extracted(self, monkeypatch, client):
@@ -233,12 +208,11 @@ class TestPartialFailure:
         # The other sections must still be populated
         assert body["sleep"] is not None
         assert body["body_battery"] is not None
-        assert body["training_readiness"] is not None
-        assert body["training_load"] is not None
+        assert body["activities"] is not None
 
     async def test_error_message_does_not_contain_exception_text(self, monkeypatch, client):
         monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
-        client.get_training_status.side_effect = ValueError("secret-token-abc123")
+        client.connectapi.side_effect = ValueError("secret-token-abc123")
         req = make_request(headers={"Authorization": "Bearer mykey"})
         resp = await dash._dashboard_handler(req)
 
@@ -247,7 +221,7 @@ class TestPartialFailure:
         body_str = str(body)
         assert "secret-token-abc123" not in body_str
         # Only the class name is recorded
-        assert body["errors"]["training_load"] == "ValueError"
+        assert body["errors"]["activities"] == "ValueError"
 
     async def test_all_sections_can_fail_returns_200(self, monkeypatch, client):
         monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
@@ -255,8 +229,7 @@ class TestPartialFailure:
         client.get_sleep_data.side_effect = err
         client.get_hrv_data.side_effect = err
         client.get_stats.side_effect = err
-        client.get_training_readiness.side_effect = err
-        client.get_training_status.side_effect = err
+        client.connectapi.side_effect = err
         req = make_request(headers={"Authorization": "Bearer mykey"})
         resp = await dash._dashboard_handler(req)
         assert resp.status_code == 200
@@ -676,3 +649,226 @@ class TestSharedStats:
         assert rhr is not None
         assert "current" in bb
         assert "bpm" in rhr
+
+
+# ---------------------------------------------------------------------------
+# Activities section and strain_7d computation
+# ---------------------------------------------------------------------------
+
+class TestActivities:
+    def _act(self, date_str="2026-10-02"):
+        """Minimal activity fixture on the given date."""
+        return {
+            "activityType": {"typeKey": "running"},
+            "startTimeLocal": f"{date_str}T07:00:00",
+            "duration": 3600.0,
+            "averageHR": 145.0,
+            "maxHR": 172.0,
+            "calories": 450.0,
+            "aerobicTrainingEffect": 3.5,
+            "anaerobicTrainingEffect": 0.5,
+        }
+
+    async def test_activities_section_present(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        body = json.loads(resp.body)
+        assert "activities" in body
+        assert "strain_7d" in body
+
+    async def test_activities_has_seven_day_keys(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        acts = json.loads(resp.body)["activities"]
+        assert len(acts) == 7
+        assert "2026-10-02" in acts
+        assert "2026-09-26" in acts
+
+    async def test_activities_fields_curated(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        client.connectapi.return_value = [self._act("2026-10-02")]
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        today_acts = json.loads(resp.body)["activities"]["2026-10-02"]
+        assert len(today_acts) == 1
+        a = today_acts[0]
+        assert a["duration_s"] == 3600
+        assert a["average_hr"] == 145.0
+        assert a["max_hr"] == 172.0
+        assert a["calories"] == 450
+        assert a["type"] == "running"
+        assert a["aerobic_te"] == 3.5
+        assert a["anaerobic_te"] == 0.5
+
+    async def test_activities_no_identifying_fields(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        client.connectapi.return_value = [
+            dict(self._act("2026-10-02"), activityName="My Secret Run", activityId=999)
+        ]
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        today_acts = json.loads(resp.body)["activities"]["2026-10-02"]
+        assert today_acts
+        a = today_acts[0]
+        forbidden = {
+            "id", "name", "activityName", "activityId",
+            "distance_meters", "startTimeLocal", "ownerDisplayName",
+            "elevation", "gps",
+        }
+        assert not (forbidden & set(a.keys())), (
+            f"Identifying fields present: {forbidden & set(a.keys())}"
+        )
+
+    async def test_activities_failure_nulls_section_and_strain(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        client.connectapi.side_effect = RuntimeError("garmin error")
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        body = json.loads(resp.body)
+        assert body["activities"] is None
+        assert body["strain_7d"] is None
+        assert body["errors"]["activities"] == "RuntimeError"
+
+    async def test_activities_failure_does_not_cancel_other_sections(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        client.connectapi.side_effect = ConnectionError("network")
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        body = json.loads(resp.body)
+        assert body["sleep"] is not None
+        assert body["body_battery"] is not None
+        assert body["hrv"] is not None
+
+    async def test_strain_7d_computed_from_activities(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        client.connectapi.return_value = [self._act("2026-10-02")]
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        body = json.loads(resp.body)
+        strain = body["strain_7d"]
+        assert strain is not None
+        assert strain["2026-10-02"] is not None
+        assert strain["2026-10-02"] > 0
+        assert strain["2026-09-26"] is None
+
+    async def test_strain_7d_all_none_when_no_activities(self, monkeypatch, client):
+        import datetime as _dt
+        monkeypatch.setenv("DASHBOARD_API_KEY", "mykey")
+        monkeypatch.setattr(dash, "_server_today", lambda: _dt.date(2026, 10, 2))
+        # connectapi returns [] by default — no activities for any day
+        req = make_request(headers={"Authorization": "Bearer mykey"})
+        resp = await dash._dashboard_handler(req)
+        import json
+        strain = json.loads(resp.body)["strain_7d"]
+        assert all(v is None for v in strain.values())
+
+    def test_compute_strain_7d_trimp_formula(self, monkeypatch):
+        """Direct unit test of the TRIMP calculation using default HRMAX=190."""
+        import math
+        monkeypatch.delenv("DASHBOARD_MAX_HR", raising=False)
+        activities_by_day = {
+            "2026-10-02": [{"duration_s": 3600, "average_hr": 145}],
+            "2026-10-01": [],
+        }
+        result = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=52)
+        hrmax = 190
+        expected_ratio = (145 - 52) / (hrmax - 52)
+        expected_trimp = 60.0 * expected_ratio * math.exp(1.92 * expected_ratio)
+        assert result["2026-10-02"] == round(expected_trimp, 1)
+        assert result["2026-10-01"] is None
+
+    def test_compute_strain_7d_fallback_resting_hr(self, monkeypatch):
+        """resting_hr_bpm=None falls back to 60 bpm."""
+        monkeypatch.delenv("DASHBOARD_MAX_HR", raising=False)
+        activities_by_day = {
+            "2026-10-02": [{"duration_s": 1800, "average_hr": 130}],
+        }
+        with_none = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=None)
+        with_60 = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=60)
+        assert with_none["2026-10-02"] == with_60["2026-10-02"]
+
+    def test_compute_strain_7d_skips_missing_avg_hr(self, monkeypatch):
+        """Activities without average_hr are skipped."""
+        monkeypatch.delenv("DASHBOARD_MAX_HR", raising=False)
+        activities_by_day = {
+            "2026-10-02": [{"duration_s": 3600}],  # no average_hr
+        }
+        result = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=60)
+        assert result["2026-10-02"] is None
+
+    def test_compute_strain_7d_degenerate_hrmax_returns_zero(self, monkeypatch):
+        """HRMAX <= rhr returns 0.0 for all days to avoid division by zero."""
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "120")  # minimum valid value
+        activities_by_day = {
+            "2026-10-02": [{"duration_s": 3600, "average_hr": 145}],
+            "2026-10-01": [],
+        }
+        # rhr=130 > hrmax=120 → degenerate (e.g. post-illness elevated resting HR)
+        result = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=130)
+        assert result["2026-10-02"] == 0.0
+        assert result["2026-10-01"] == 0.0
+
+    def test_athlete_max_hr_default(self, monkeypatch):
+        """Absent env var yields default of 190."""
+        monkeypatch.delenv("DASHBOARD_MAX_HR", raising=False)
+        assert dash._athlete_max_hr() == 190
+
+    def test_athlete_max_hr_valid_override(self, monkeypatch):
+        """Valid integer in range is accepted."""
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "185")
+        assert dash._athlete_max_hr() == 185
+
+    def test_athlete_max_hr_boundary_values(self, monkeypatch):
+        """Boundary values 120 and 230 are accepted."""
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "120")
+        assert dash._athlete_max_hr() == 120
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "230")
+        assert dash._athlete_max_hr() == 230
+
+    def test_athlete_max_hr_out_of_range_falls_back(self, monkeypatch):
+        """Values outside 120-230 fall back to 190."""
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "300")
+        assert dash._athlete_max_hr() == 190
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "100")
+        assert dash._athlete_max_hr() == 190
+
+    def test_athlete_max_hr_non_integer_falls_back(self, monkeypatch):
+        """Non-integer value falls back to 190."""
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "not-a-number")
+        assert dash._athlete_max_hr() == 190
+
+    def test_athlete_max_hr_used_in_strain_computation(self, monkeypatch):
+        """DASHBOARD_MAX_HR override is reflected in computed TRIMP."""
+        import math
+        monkeypatch.setenv("DASHBOARD_MAX_HR", "185")
+        activities_by_day = {
+            "2026-10-02": [{"duration_s": 3600, "average_hr": 145}],
+        }
+        result = dash._compute_strain_7d(activities_by_day, resting_hr_bpm=52)
+        hrmax = 185
+        expected_ratio = (145 - 52) / (hrmax - 52)
+        expected_trimp = 60.0 * expected_ratio * math.exp(1.92 * expected_ratio)
+        assert result["2026-10-02"] == round(expected_trimp, 1)
